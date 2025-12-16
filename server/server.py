@@ -69,6 +69,16 @@ logging.getLogger("mcp").addHandler(handler)
 
 # Load environment variables
 load_dotenv()
+import re
+
+BASE_PROFILE_DIR = os.environ.get(
+    "BASE_PROFILE_DIR",
+    "/data/chrome-profiles"
+)
+
+def sanitize_profile_id(profile_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", profile_id)
+
 
 
 def parse_bool_env(env_var: str, default: bool = False) -> bool:
@@ -139,61 +149,47 @@ task_store: Dict[str, Dict[str, Any]] = {}
 
 
 async def create_browser_context_for_task(
+    profile_id: str,
     chrome_path: Optional[str] = None,
     window_width: int = CONFIG["DEFAULT_WINDOW_WIDTH"],
     window_height: int = CONFIG["DEFAULT_WINDOW_HEIGHT"],
     locale: str = CONFIG["DEFAULT_LOCALE"],
 ) -> Tuple[Browser, BrowserContext]:
-    """
-    Create a fresh browser and context for a task.
 
-    This function creates an isolated browser instance and context
-    with proper configuration for a single task.
+    profile_id = sanitize_profile_id(profile_id)
+    profile_dir = os.path.join(BASE_PROFILE_DIR, profile_id)
+    os.makedirs(profile_dir, exist_ok=True)
 
-    Args:
-        chrome_path: Path to Chrome executable
-        window_width: Browser window width
-        window_height: Browser window height
-        locale: Browser locale
+    logger.info(f"Using Chrome profile_id={profile_id} dir={profile_dir}")
 
-    Returns:
-        A tuple containing the browser instance and browser context
+    browser_config = BrowserConfig(
+        extra_chromium_args=CONFIG["BROWSER_ARGS"],
+        user_data_dir=profile_dir,   # ⭐ CORE
+    )
 
-    Raises:
-        Exception: If browser or context creation fails
-    """
-    try:
-        # Create browser configuration
-        browser_config = BrowserConfig(
-            extra_chromium_args=CONFIG["BROWSER_ARGS"],
-        )
+    if chrome_path:
+        browser_config.chrome_instance_path = chrome_path
 
-        # Set chrome path if provided
-        if chrome_path:
-            browser_config.chrome_instance_path = chrome_path
+    browser = Browser(config=browser_config)
 
-        # Create browser instance
-        browser = Browser(config=browser_config)
+    context_config = BrowserContextConfig(
+        wait_for_network_idle_page_load_time=0.6,
+        maximum_wait_page_load_time=1.2,
+        minimum_wait_page_load_time=0.2,
+        browser_window_size={"width": window_width, "height": window_height},
+        locale=locale,
+        user_agent=CONFIG["DEFAULT_USER_AGENT"],
+        highlight_elements=True,
+        viewport_expansion=0,
+    )
 
-        # Create context configuration
-        context_config = BrowserContextConfig(
-            wait_for_network_idle_page_load_time=0.6,
-            maximum_wait_page_load_time=1.2,
-            minimum_wait_page_load_time=0.2,
-            browser_window_size={"width": window_width, "height": window_height},
-            locale=locale,
-            user_agent=CONFIG["DEFAULT_USER_AGENT"],
-            highlight_elements=True,
-            viewport_expansion=0,
-        )
+    context = BrowserContext(
+        browser=browser,
+        config=context_config,
+    )
 
-        # Create context with the browser
-        context = BrowserContext(browser=browser, config=context_config)
+    return browser, context
 
-        return browser, context
-    except Exception as e:
-        logger.error(f"Error creating browser context: {str(e)}")
-        raise
 
 
 async def run_browser_task_async(
@@ -201,6 +197,7 @@ async def run_browser_task_async(
     url: str,
     action: str,
     llm: BaseLanguageModel,
+    profile_id: str,
     window_width: int = CONFIG["DEFAULT_WINDOW_WIDTH"],
     window_height: int = CONFIG["DEFAULT_WINDOW_HEIGHT"],
     locale: str = CONFIG["DEFAULT_LOCALE"],
@@ -280,6 +277,7 @@ async def run_browser_task_async(
 
         # Create a fresh browser and context for this task
         browser, context = await create_browser_context_for_task(
+            profile_id=profile_id,
             chrome_path=chrome_path,
             window_width=window_width,
             window_height=window_height,
@@ -351,8 +349,8 @@ async def run_browser_task_async(
         try:
             if context:
                 await context.close()
-            if browser:
-                await browser.close()
+            # if browser:
+            #     await browser.close()
             logger.info(f"Browser resources for task {task_id} cleaned up")
         except Exception as e:
             logger.error(
@@ -447,7 +445,10 @@ def create_mcp_server(
                 raise ValueError("Missing required argument 'url'")
             if "action" not in arguments:
                 raise ValueError("Missing required argument 'action'")
-
+            profile_id = arguments.get("profile_id", "default")
+            logger.info(
+                f"[browser_use] task_id={task_id} profile_id={profile_id}"
+            )
             # Generate a task ID
             task_id = str(uuid.uuid4())
 
@@ -455,18 +456,21 @@ def create_mcp_server(
             task_store[task_id] = {
                 "id": task_id,
                 "status": "pending",
-                "url": arguments["url"],
-                "action": arguments["action"],
+                "url": url,
+                "action": action,
+                "profile_id": profile_id,   # ⭐ THÊM
                 "created_at": datetime.now().isoformat(),
             }
+
 
             # Start task in background
             _task = asyncio.create_task(
                 run_browser_task_async(
                     task_id=task_id,
-                    url=arguments["url"],
-                    action=arguments["action"],
+                    url=url,
+                    action=action,
                     llm=llm,
+                    profile_id=profile_id,   # ⭐ TRUYỀN VÀO
                     window_width=window_width,
                     window_height=window_height,
                     locale=locale,
